@@ -1,0 +1,9 @@
+requests v2.32.3
+├── certifi v2024.7.4
+├── charset-normalizer v3.3.2
+├── idna v3.7
+└── urllib3 v2.2.2
+rich v13.7.1
+├── markdown-it-py v3.0.0
+│   └── mdurl v0.1.2
+└── pygments v2.18.0

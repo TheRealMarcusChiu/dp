@@ -1,0 +1,715 @@
+#!/usr/bin/env python3
+"""dp: one dependency-tree view across package managers.
+
+Runs an inspection command of the native tool already on PATH, turns its output
+into a small graph, and prints it as a tree, a JSON snapshot, or passes the native
+output through untouched. dp itself never issues install, restore, lock, update or
+fetch commands, but the native tools still evaluate project build files and may
+resolve, download into caches or write metadata. Python 3.8+, standard library only.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SCHEMA = 'dp.graph/1'
+PROBLEMS = {'missing', 'invalid', 'extraneous', 'failed'}
+
+
+class Fail(Exception):
+    """User-facing error: printed as `dp: ...`, exit status 2."""
+
+
+OPTIONAL = ('version', 'context', 'status', 'kind')
+
+
+def valid_fields(required, *optional):
+    """Policy: required fields are non-empty strings; optional ones are absent/None or strings."""
+    return all(isinstance(v, str) and v for v in required) and all(v is None or isinstance(v, str) for v in optional)
+
+
+class Graph:
+    """Nodes keyed by stable id (name@version, plus context/status/kind when present) and labelled edges."""
+
+    def __init__(self, tool, semantics):
+        self.tool, self.semantics = tool, semantics
+        self.nodes, self.edges, self.roots, self.warnings = {}, {}, [], []
+        self.problem = False  # the native tool reported missing/invalid/failed dependencies
+
+    # shortcut: except Cargo (opaque package id), backends identify a package by logical name@version, so a
+    # registry -> git/file swap at the same version is not a graph change; add source to context per backend
+    # if source fidelity is needed.
+    def node(self, name, version=None, context=None, status=None, kind=None):
+        if not valid_fields([name], version, context, status, kind):
+            raise Fail('unsupported %s output: package name/version must be text, got %r %r' % (self.tool, name, version))
+        nid =((kind + ':' if kind else '') + name + ('@' + version if version else '')
+               + (' [%s]' % context if context else '') + (' (%s)' % status if status else ''))
+        fields = (('id', nid), ('name', name), ('version', version), ('context', context),
+                  ('status', status), ('kind', kind))
+        self.nodes.setdefault(nid, {k: v for k, v in fields if v})
+        self.problem = self.problem or status in PROBLEMS
+        return nid
+
+    def root(self, *args, **kwargs):
+        nid = self.node(*args, **kwargs)
+        if nid not in self.roots:
+            self.roots.append(nid)
+        return nid
+
+    def edge(self, parent, child, label=None):
+        self.edges[(parent, child, label or None)] = None  # dict as an insertion-ordered set
+
+    def snapshot(self, provenance):
+        return {'schema': SCHEMA, 'tool': self.tool, 'semantics': self.semantics, 'roots': self.roots,
+                'nodes': sorted(self.nodes.values(), key=lambda n: n['id']),
+                'edges': [dict({'from': a, 'to': b}, **({'label': l} if l else {}))
+                          for a, b, l in sorted(self.edges, key=lambda e: (e[0], e[1], e[2] or ''))],
+                'warnings': self.warnings, 'provenance': provenance}
+
+
+def render(g, depth=None, ascii=False):
+    """Tree text; each shared subtree is expanded once, later occurrences end in (*), back-edges in (cycle)."""
+    tee, last, pipe, blank = ('+-- ', '\\-- ', '|   ', '    ') if ascii else ('├── ', '└── ', '│   ', '    ')
+    kids = {}
+    for a, b, label in g.edges:
+        kids.setdefault(a, []).append((b, label))
+    out, expanded, path = [], set(), set()
+    stack = [('enter', r, None, '', '', 0) for r in reversed(g.roots)]
+    while stack:  # iterative so deep graphs cannot hit the recursion limit
+        item = stack.pop()
+        if item[0] == 'exit':
+            path.discard(item[1])
+            continue
+        _, nid, label, line, indent, level = item
+        n, children = g.nodes[nid], kids.get(nid, [])
+        text = ' '.join(filter(None, [n['name'], n.get('version'), label and '(%s)' % label,
+                                      level == 0 and n.get('context') and '[%s]' % n['context'],
+                                      n.get('status') and '[%s]' % n['status']]))
+        if nid in path:
+            text, children = text + ' (cycle)', []
+        elif children and nid in expanded:
+            text, children = text + ' (*)', []
+        elif depth is not None and level >= depth:
+            children = []
+        out.append(line + text)
+        if children:
+            expanded.add(nid)
+            path.add(nid)
+            stack.append(('exit', nid))
+            for i in reversed(range(len(children))):
+                end = i == len(children) - 1
+                stack.append(('enter', children[i][0], children[i][1], indent + (last if end else tee),
+                              indent + (blank if end else pipe), level + 1))
+    return '\n'.join(out)
+
+
+def run(cmd, cwd, check=True, quiet=False):
+    """Run argv (never a shell) with stdin closed; stderr is forwarded, failures name the exact command."""
+    exe = shutil.which(cmd[0])
+    if not exe:
+        raise Fail('%s not found on PATH (dp never substitutes another tool)' % cmd[0])
+    p = subprocess.run([exe] + cmd[1:], cwd=cwd, stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, encoding='utf-8', errors='replace')
+    if p.returncode and check:
+        sys.stderr.write(p.stdout + p.stderr)  # Maven and others report build errors on stdout
+        raise Fail('command failed (exit %d): %s' % (p.returncode, shlex.join(cmd)))
+    if p.stderr and not quiet:
+        sys.stderr.write(p.stderr)
+    return p
+
+
+def load_json(text, cmd):
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise Fail('unsupported output from %s (not JSON)' % shlex.join(cmd))
+
+
+def done(g, **provenance):
+    g.provenance = provenance
+    return g
+
+
+# ---------------------------------------------------------------- adapters
+# Each adapter takes (directory, native_args, native) and returns the native argv when
+# native is true, otherwise a Graph.
+
+def parse_npm(data):
+    if not isinstance(data, dict):
+        raise Fail('unsupported npm ls JSON (expected an object)')
+    g = Graph('npm', 'installed node_modules dependency tree (npm ls --all)')
+    g.warnings += [p for p in data.get('problems', []) if isinstance(p, str)]
+
+    def walk(parent, deps):
+        if not isinstance(deps, dict):
+            raise Fail('unsupported npm ls JSON (dependencies is not an object)')
+        for name, info in deps.items():
+            if not isinstance(info, dict):
+                raise Fail('unsupported npm ls JSON entry for %s' % name)
+            status = ('missing' if info.get('missing') else 'invalid' if info.get('invalid')
+                      else 'extraneous' if info.get('extraneous') else None)
+            label = 'required %s' % info['required'] if status == 'missing' and info.get('required') else None
+            nid = g.node(name, None if status == 'missing' else info.get('version'), status=status)
+            g.edge(parent, nid, label)
+            walk(nid, info.get('dependencies', {}))
+
+    walk(g.root(data.get('name') or '(unnamed)', data.get('version')), data.get('dependencies', {}))
+    return g
+
+
+def tool_npm(d, extra, native):
+    cmd = ['npm', 'ls', '--all'] + ([] if native else ['--json']) + extra
+    if native:
+        return cmd
+    p = run(cmd, d, check=False)
+    try:
+        data = json.loads(p.stdout)
+    except ValueError:
+        data = None
+    if p.returncode and not (isinstance(data, dict) and data.get('problems')):
+        sys.stderr.write(p.stdout)
+        raise Fail('command failed (exit %d): %s' % (p.returncode, shlex.join(cmd)))
+    g = parse_npm(load_json(p.stdout, cmd))
+    g.problem = g.problem or bool(p.returncode)  # npm exits 1 for ELSPROBLEMS; keep that visible
+    return done(g, command=cmd)
+
+
+def tree_line(line, units, connectors):
+    """(depth, text) of a native tree line, (0, line) for an unindented line, None for anything else."""
+    n, i = len(units[0]), 0
+    while line[i:i + n] in units:
+        i += n
+    if line[i:i + n] in connectors:
+        return i // n + 1, line[i + n:]
+    return None if i else (0, line)
+
+
+def attach(g, stack, depth, nid, label=None):
+    """Link nid under the node currently open at depth-1; stack holds the open path."""
+    if depth > len(stack):
+        raise Fail('unexpected tree indentation at %s' % nid)
+    del stack[depth:]
+    if depth:
+        g.edge(stack[-1], nid, label)
+    stack.append(nid)
+
+
+def parse_uv(text, g, root=None):
+    """`uv tree` / `uv pip tree` text. Top-level lines become roots, or children of root when given."""
+    stack = [root] if root else []
+    for line in text.splitlines():
+        if not line.strip() or line.startswith('(*) '):  # blank / legend
+            continue
+        r = tree_line(line, ('│   ', '    '), ('├── ', '└── '))
+        m = r and re.match(r'(\S+)(?: v(\S+))?((?: \([^)]*\))*)$', r[1])
+        if not m:
+            raise Fail('unsupported uv tree line: %r' % line)
+        name, version, notes = m.groups()
+        labels = [x for x in re.findall(r'\(([^)]*)\)', notes) if x != '*']
+        nid = g.node(name, version) if root or r[0] else g.root(name, version)
+        attach(g, stack, r[0] + bool(root), nid, ', '.join(labels))
+    return g
+
+
+def tool_uv(d, extra, native):
+    if not os.path.isfile(os.path.join(d, 'uv.lock')):
+        raise Fail('no uv.lock in %s; dp does not run `uv lock`. Run it yourself, or use `dp pip` '
+                   'for an installed environment' % d)
+    cmd = ['uv', 'tree', '--frozen', '--color', 'never', '--no-python-downloads'] + extra
+    if native:
+        return cmd
+    g = parse_uv(run(cmd, d).stdout, Graph('uv', 'resolution recorded in the existing uv.lock (uv tree --frozen); '
+                                               'may be stale versus pyproject.toml'))
+    if not g.roots:
+        raise Fail('%s printed no project tree' % shlex.join(cmd))
+    return done(g, command=cmd)
+
+
+def tool_pip(d, extra, native, pip):
+    # The tree must describe the environment THIS pip manages, not the Python running dp.
+    m = re.search(r'^sys\.executable:\s*(\S.*?)\s*$', run([pip, 'debug'], d, quiet=True).stdout, re.M)
+    if not m:
+        raise Fail('`%s debug` did not report sys.executable, so dp cannot tell which Python it manages' % pip)
+    cmd = ['uv', 'pip', 'tree', '--python', m.group(1), '--color', 'never', '--no-python-downloads'] + extra
+    if native:
+        return cmd
+    g = Graph(pip, 'installed packages of the environment managed by %s (uv pip tree); the environment root '
+                   'links to packages nothing else requires' % pip)
+    g.warnings.append('interpreter %s taken from experimental `%s debug` output' % (m.group(1), pip))
+    parse_uv(run(cmd, d).stdout, g, g.root('environment', kind='environment'))
+    return done(g, command=cmd)
+
+
+def parse_mvn(text):
+    """dependency:tree text (outputFile, so no [INFO] log lines). Each module is its own root and its
+    dependencies are scoped to it (context = module root id): modules resolve the same artifact differently."""
+    g = Graph('mvn', 'Maven resolved dependency tree per module (dependency:tree, conflicts already resolved)')
+    stack, module = [], None
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        r = tree_line(line, ('|  ', '   '), ('+- ', '\\- '))
+        coord, _, extra = r[1].partition(' ') if r else ('', '', '')
+        parts = coord.split(':')
+        scope = parts.pop() if r and r[0] and len(parts) in (5, 6) else None
+        if len(parts) not in (4, 5) or bool(r[0]) != bool(scope) or coord.startswith('('):
+            raise Fail('unsupported Maven tree line (verbose output is not supported): %r' % line)
+        group, artifact, typ, *classifier, version = parts
+        name = ':'.join([group, artifact] + ([typ] + classifier if typ != 'jar' or classifier else []))
+        if r[0]:
+            nid = g.node(name, version, module)
+        else:
+            nid = module = g.root(name, version)
+        attach(g, stack, r[0], nid, ', '.join(filter(None, [scope, extra.strip().strip('()')])))
+    if not g.roots:
+        raise Fail('Maven wrote an empty dependency tree')
+    return g
+
+
+def tool_mvn(d, extra, native):
+    # No ./mvnw: wrappers can download a Maven distribution. Offline: use the local repository only.
+    if native:
+        return ['mvn', '-o', '-B', 'dependency:tree'] + extra
+    with tempfile.TemporaryDirectory() as tmp:
+        out = os.path.join(tmp, 'tree.txt')
+        cmd = ['mvn', '-o', '-B', 'dependency:tree', '-DoutputType=text', '-DappendOutput=true',
+               '-DoutputFile=' + out] + extra
+        run(cmd, d, quiet=True)
+        try:
+            with open(out, encoding='utf-8') as f:
+                text = f.read()
+        except OSError:
+            raise Fail('%s succeeded but wrote no dependency tree' % shlex.join(cmd))
+    return done(parse_mvn(text), command=cmd)
+
+
+def gradle_dep(text):
+    """'g:a:1 -> 2 (*)' etc. -> (name, version, edge label, status)."""
+    flags = []
+    while text.endswith((' (*)', ' (c)', ' (n)', ' FAILED')):
+        text, _, flag = text.rpartition(' ')
+        flags.append(flag)
+    left, arrow, right = text.partition(' -> ')
+    coord = lambda s: (s, None) if s.startswith('project ') else (':'.join(s.split(':')[:2]), ':'.join(s.split(':')[2:]) or None)
+    name, requested = coord(left)
+    version = requested
+    if arrow:
+        name, version = coord(right) if right.startswith('project ') or ':' in right else (name, right)
+    labels = [('requested %s' % (requested or '(none)') if coord(left)[0] == name else 'substitutes ' + left) if arrow else None,
+              '(c)' in flags and 'constraint', '(n)' in flags and 'not resolved']
+    return name, version, ', '.join(filter(None, labels)), 'failed' if 'FAILED' in flags else None
+
+
+def parse_gradle(text):
+    """`gradle dependencies` text: one root per configuration; node ids are scoped to the configuration."""
+    g = Graph('gradle', 'Gradle dependency report of one project, one root per configuration '
+                        '(-> marks conflict resolution, constraint/not resolved edges are not installed dependencies)')
+    stack = prev = config = None
+    for line in text.splitlines():
+        r = tree_line(line, ('|    ', '     '), ('+--- ', '\\--- '))
+        if stack is None and ((r and r[0]) or line.strip() == 'No dependencies'):
+            if not prev:
+                raise Fail('unsupported Gradle output line: %r' % line)
+            config = prev.split(' - ')[0].strip()
+            stack = [g.root(config, kind='configuration')]
+        if r and r[0]:
+            name, version, label, status = gradle_dep(r[1])
+            attach(g, stack, r[0], g.node(name, version, config, status), label)
+        elif line.strip() != 'No dependencies':
+            stack, prev = None, line.strip()
+    if not g.roots:
+        raise Fail('no Gradle dependency report found in the output')
+    return g
+
+
+def tool_gradle(d, extra, native):
+    # Global gradle only (never ./gradlew), offline, no init scripts.
+    cmd = ['gradle', '--offline', '--console=plain', '-q', 'dependencies'] + extra
+    return cmd if native else done(parse_gradle(run(cmd, d).stdout), command=cmd)
+
+
+def parse_assets(data, fallback_name):
+    """NuGet's restored graph: one root per target (framework or framework/RID), packages scoped to it."""
+    g = Graph('dotnet', 'NuGet restore graph read from obj/project.assets.json, one root per target framework/RID '
+                        '(as of the last restore)')
+    def need(ok, what):
+        if not ok:
+            raise Fail('unsupported project.assets.json: %s' % what)
+    obj = lambda v: v is None or isinstance(v, dict)  # optional object: absent/null allowed, [] or "" are not
+    targets, groups = data.get('targets'), data.get('projectFileDependencyGroups')
+    need(isinstance(targets, dict) and targets, '"targets" must be a non-empty object')
+    need(isinstance(groups, dict), '"projectFileDependencyGroups" must be an object')
+    need(obj(data.get('project')) and obj((data.get('project') or {}).get('restore')), '"project"/"restore" must be objects')
+    project = data.get('project') or {}
+    name = (project.get('restore') or {}).get('projectName') or fallback_name
+    for target, libs in targets.items():
+        need(isinstance(libs, dict) and all(isinstance(lib, dict) and obj(lib.get('dependencies')) for lib in libs.values()),
+             'target %s must map libraries to objects with object "dependencies"' % target)
+        entries = groups.get(target.split('/')[0], [])
+        need(isinstance(entries, list) and all(isinstance(e, str) and e.split() for e in entries),
+             'projectFileDependencyGroups for %s must be a list of strings' % target)
+        root = g.root(name, project.get('version'), target)
+        ids = {key: g.node(*key.split('/', 1), context=target) for key in libs}
+        by_name = {key.split('/')[0].lower(): key for key in libs}  # NuGet picks one version per id per target
+
+        def link(parent, dep):
+            if dep.lower() in by_name:
+                g.edge(parent, ids[by_name[dep.lower()]])
+            else:
+                g.warnings.append('%s: %s is not in the restored graph' % (target, dep))
+        for key, lib in libs.items():
+            for dep in lib.get('dependencies') or {}:
+                link(ids[key], dep)
+        if target.split('/')[0] not in groups:
+            raise Fail('project.assets.json has no projectFileDependencyGroups entry for %s' % target)
+        for entry in groups[target.split('/')[0]]:
+            link(root, entry.split()[0])
+    return g
+
+
+def tool_dotnet(d, extra, native):
+    projects = sorted(f for f in os.listdir(d) if f.endswith(('.csproj', '.fsproj', '.vbproj')))
+    if len(projects) != 1:
+        raise Fail('%s has %s; run dp dotnet -C <directory with exactly one project file>' % (
+            d, ', '.join(projects) if projects else 'no .csproj/.fsproj/.vbproj (a .sln can hold several projects)'))
+    project = os.path.join(d, projects[0])
+    assets = os.path.join(d, 'obj', 'project.assets.json')
+    if not os.path.isfile(assets):
+        if os.path.isfile(os.path.join(d, 'packages.config')):
+            raise Fail('packages.config is a flat package list with no dependency edges, so dp cannot show a tree; '
+                       'migrate the project to PackageReference to get one')
+        raise Fail('no obj/project.assets.json; dp does not restore. Run `dotnet restore %s` yourself' % shlex.quote(project))
+    if os.path.getmtime(assets) < os.path.getmtime(project):
+        raise Fail('obj/project.assets.json is older than %s; run `dotnet restore %s` yourself'
+                   % (projects[0], shlex.quote(project)))
+    if native:
+        # The SDK chosen here (global.json applies) decides the syntax; SDK 10+ restores implicitly unless told not to.
+        sdk = run(['dotnet', '--version'], d, quiet=True).stdout.strip()
+        m = re.match(r'(\d+)\.\d+\.\d+', sdk)
+        if not m:
+            raise Fail('unexpected `dotnet --version` output: %r' % sdk)
+        if int(m.group(1)) >= 10:
+            return ['dotnet', 'package', 'list', '--project', project, '--include-transitive', '--no-restore'] + extra
+        return ['dotnet', 'list', project, 'package', '--include-transitive'] + extra
+    if extra:
+        raise Fail('the dotnet tree is read from obj/project.assets.json; native arguments need --format native')
+    try:
+        with open(assets, encoding='utf-8-sig') as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Fail('cannot read %s: %s' % (assets, e))
+    if not isinstance(data, dict):
+        raise Fail('unsupported project.assets.json')
+    g = parse_assets(data, projects[0].rsplit('.', 1)[0])
+    g.warnings.append('freshness of obj/project.assets.json was checked against %s only, not imported files '
+                      '(Directory.Packages.props, Directory.Build.props, NuGet.config); restore if those changed'
+                      % projects[0])
+    return done(g, file=assets)
+
+
+def parse_pnpm(data):
+    if not isinstance(data, list):
+        raise Fail('unsupported pnpm list JSON (expected a list of projects)')
+    g = Graph('pnpm', 'installed dependency tree per project (pnpm list --depth Infinity)')
+
+    def walk(parent, deps, label=None):
+        if not isinstance(deps, dict):
+            raise Fail('unsupported pnpm list JSON (dependencies is not an object)')
+        for alias, info in deps.items():
+            name = info.get('from') or alias
+            nid = g.node(name, info.get('version'))
+            g.edge(parent, nid, ', '.join(filter(None, [label, alias != name and 'as ' + alias])))
+            walk(nid, info.get('dependencies') or {})
+    try:
+        for project in data:
+            root = g.root(project.get('name') or '(unnamed)', project.get('version'))
+            for key, label in (('dependencies', None), ('devDependencies', 'dev'), ('optionalDependencies', 'optional')):
+                walk(root, project.get(key) or {}, label)
+    except AttributeError:
+        raise Fail('unsupported pnpm list JSON entry')
+    return g
+
+
+def tool_pnpm(d, extra, native):
+    cmd = ['pnpm', 'list'] + ([] if native else ['--json']) + ['--depth', 'Infinity'] + extra
+    return cmd if native else done(parse_pnpm(load_json(run(cmd, d).stdout, cmd)), command=cmd)
+
+
+def parse_cargo(data):
+    g = Graph('cargo', 'Cargo resolved graph for all platforms (cargo metadata); labels are dependency kinds/targets')
+    try:
+        if data['resolve'] is None:
+            raise Fail('cargo metadata has no resolve graph (was --no-deps passed?)')
+        # The opaque package id (source + version) is the context, so a registry and a git copy of the same
+        # name@version stay two nodes and a source switch shows in --diff. Ids are never parsed.
+        ids = {p['id']: g.node(p['name'], p['version'], p['id']) for p in data['packages']}
+        for n in data['resolve']['nodes']:
+            for dep in n['deps']:
+                kinds = [' '.join(filter(None, (k.get('kind'), k.get('target')))) for k in dep.get('dep_kinds', [])]
+                g.edge(ids[n['id']], ids[dep['pkg']], ', '.join(filter(None, kinds)))
+        g.roots = [ids[member] for member in data['workspace_members']]  # a virtual workspace has no single root
+    except (KeyError, TypeError, AttributeError) as e:
+        raise Fail('unsupported cargo metadata JSON (%s)' % e)
+    return g
+
+
+def tool_cargo(d, extra, native):
+    if native:
+        return ['cargo', 'tree', '--frozen'] + extra
+    cmd = ['cargo', 'metadata', '--format-version', '1', '--frozen'] + extra
+    return done(parse_cargo(load_json(run(cmd, d).stdout, cmd)), command=cmd)
+
+
+def parse_go(text, gomod=''):
+    g = Graph('go', 'Go module requirement graph (go mod graph): edges are go.mod requirements, not the selected '
+                    'build list, so a module can appear at several versions')
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        vertices = line.split()
+        if len(vertices) != 2:
+            raise Fail('unsupported go mod graph line: %r' % line)
+        a, b = [g.node(*v.split('@', 1)) if '@' in v else g.root(v) for v in vertices]  # main modules have no @
+        g.edge(a, b)
+    m = re.search(r'^module\s+"?([^\s"]+)', gomod, re.M)
+    if not g.roots and m:
+        g.root(m.group(1))
+    if not g.roots:
+        raise Fail('go mod graph printed nothing and go.mod names no module')
+    return g
+
+
+def tool_go(d, extra, native):
+    cmd = ['go', 'mod', 'graph'] + extra
+    if native:
+        return cmd
+    try:
+        with open(os.path.join(d, 'go.mod'), encoding='utf-8') as f:
+            gomod = f.read()
+    except OSError:
+        gomod = ''
+    return done(parse_go(run(cmd, d).stdout, gomod), command=cmd)
+
+
+def parse_composer(data):
+    if not isinstance(data, dict) or not isinstance(data.get('installed'), list):
+        raise Fail('unsupported composer show --tree JSON (expected {"installed": [...]})')
+    g = Graph('composer', 'Composer tree of the root requirements (show --tree); edge labels are constraints, '
+                          'child versions are only known when Composer reports them as "installed"')
+    root = g.root('project', kind='project')
+
+    def walk(parent, items):
+        for item in items:
+            # top-level "version" is the installed version; below it "version" is the constraint
+            nid = g.node(item['name'], item.get('version') if parent == root else item.get('installed'))
+            g.edge(parent, nid, None if parent == root else item.get('version'))
+            walk(nid, item.get('requires') or [])
+    try:
+        walk(root, data['installed'])
+    except (KeyError, TypeError, AttributeError) as e:
+        raise Fail('unsupported composer show --tree JSON (%s)' % e)
+    return g
+
+
+def tool_composer(d, extra, native):
+    cmd = ['composer', '--no-plugins', '--no-scripts', '--no-interaction', 'show', '--tree'] \
+        + ([] if native else ['--format=json']) + extra
+    return cmd if native else done(parse_composer(load_json(run(cmd, d).stdout, cmd)), command=cmd)
+
+
+def native_only(*cmd):
+    def tool(d, extra, native):
+        if not native:
+            raise Fail('%s has no machine-readable dependency graph dp can trust; use --format native' % cmd[0])
+        return list(cmd) + extra
+    return tool
+
+
+def tool_yarn(d, extra, native):
+    modern = os.path.exists(os.path.join(d, '.yarnrc.yml'))  # Yarn 2+ has no `yarn list`
+    return native_only(*(['yarn', 'info', '--all', '--recursive'] if modern else ['yarn', 'list']))(d, extra, native)
+
+
+TOOLS = {'npm': tool_npm, 'pnpm': tool_pnpm, 'yarn': tool_yarn, 'bun': native_only('bun', 'pm', 'ls', '--all'),
+         'mvn': tool_mvn, 'gradle': tool_gradle, 'uv': tool_uv,
+         'pip': lambda d, e, n: tool_pip(d, e, n, 'pip'), 'pip3': lambda d, e, n: tool_pip(d, e, n, 'pip3'),
+         'dotnet': tool_dotnet, 'cargo': tool_cargo, 'go': tool_go, 'composer': tool_composer,
+         # fail instead of re-resolving and rewriting Package.resolved
+         'swift': native_only('swift', 'package', '--force-resolved-versions', '--skip-update',
+                              'show-dependencies', '--format', 'text'),
+         'bundle': native_only('bundle', 'list'), 'poetry': native_only('poetry', 'show', '--tree')}
+ALIASES = {'maven': 'mvn', 'nuget': 'dotnet', 'bundler': 'bundle', 'swiftpm': 'swift', 'golang': 'go'}
+JS = ('npm', 'pnpm', 'yarn', 'bun')
+MARKERS = [('mvn', 'pom.xml'), ('gradle', 'build.gradle'), ('gradle', 'build.gradle.kts'), ('gradle', 'settings.gradle'),
+           ('gradle', 'settings.gradle.kts'), ('uv', 'uv.lock'), ('poetry', 'poetry.lock'), ('cargo', 'Cargo.toml'),
+           ('go', 'go.mod'), ('composer', 'composer.json'), ('swift', 'Package.swift'), ('bundle', 'Gemfile'),
+           ('npm', 'package-lock.json'), ('npm', 'npm-shrinkwrap.json'), ('npm', 'node_modules/.package-lock.json'),
+           ('pnpm', 'pnpm-lock.yaml'), ('yarn', 'yarn.lock'), ('bun', 'bun.lock'), ('bun', 'bun.lockb')]
+
+
+def detect(d):
+    """Pick the tool from files in d only (no recursive scan); refuse to guess when evidence conflicts."""
+    found = {}
+    for tool, f in MARKERS:
+        if os.path.exists(os.path.join(d, f)):
+            found.setdefault(tool, f)
+    dotnet = sorted(f for f in os.listdir(d) if f.endswith(('.csproj', '.fsproj', '.vbproj', '.sln', '.slnx')))
+    if dotnet:
+        found['dotnet'] = dotnet[0]
+    if os.path.isfile(os.path.join(d, 'package.json')):
+        try:
+            with open(os.path.join(d, 'package.json'), encoding='utf-8') as f:
+                pm = json.load(f).get('packageManager', '').split('@')[0]
+        except (OSError, ValueError, AttributeError):
+            pm = ''
+        if pm in JS:
+            found.setdefault(pm, 'package.json packageManager')
+        if not any(t in found for t in JS):
+            found[' or '.join(JS)] = 'package.json without a lockfile or packageManager'
+    if not found:
+        raise Fail('no supported project files in %s; name a tool, e.g. `dp pip` for the current Python environment' % d)
+    if len(found) == 1 and next(iter(found)) in TOOLS:
+        return next(iter(found))
+    raise Fail('cannot choose a tool for %s (found %s); run one of:\n%s' % (
+        d, ', '.join('%s: %s' % kv for kv in found.items()),
+        '\n'.join('  dp %s -C %s' % (t, shlex.quote(d)) for k in found for t in (k.split(' or ') if ' or ' in k else [k]))))
+
+
+# ---------------------------------------------------------------- CLI
+
+EPILOG = '''\
+tools:
+  normalized tree/json + native: npm pnpm mvn(maven) gradle uv pip pip3 dotnet(nuget) cargo go composer
+  native only:                   yarn bun bundle(bundler) swift(swiftpm) poetry
+  dp uv shows the existing uv.lock; dp pip/pip3 show the environment of that pip (needs uv).
+--format native runs the native command and passes its output and exit status through.
+--depth/--direct/--ascii shape the tree only; JSON snapshots are never truncated.
+Exit status: 0 ok/identical, 1 dependency problems reported or snapshots differ, 2 error.
+dp issues no install/restore/lock/update commands, but native tools still run project code
+and may resolve, fill caches or write metadata (not a sandbox): use dp on trusted projects only.'''
+
+
+def main(argv):
+    extra = []
+    if '--' in argv:
+        i = argv.index('--')
+        argv, extra = argv[:i], argv[i + 1:]
+    p = argparse.ArgumentParser(
+        prog='dp', epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter,
+        usage='dp [TOOL] [-C DIRECTORY] [--format tree|json|native] [--depth N | --direct] [--ascii] '
+              '[-- NATIVE_ARGS...]\n       dp --diff BEFORE.json AFTER.json',
+        description='Show a project dependency tree the same way for many package managers. '
+                    'NATIVE_ARGS after -- are appended to the native command.')
+    p.add_argument('tool', nargs='?', metavar='TOOL', choices=sorted(TOOLS) + sorted(ALIASES),
+                   help='package manager (default: detected from DIRECTORY)')
+    p.add_argument('-C', dest='directory', metavar='DIRECTORY', help='project directory (default: current)')
+    p.add_argument('--format', choices=['tree', 'json', 'native'], default='tree')
+    depth = p.add_mutually_exclusive_group()
+    depth.add_argument('--depth', type=int, metavar='N', help='show N levels below the roots (0 = roots only)')
+    depth.add_argument('--direct', action='store_true', help='same as --depth 1')
+    p.add_argument('--ascii', action='store_true', help='ASCII tree connectors')
+    p.add_argument('--diff', nargs=2, metavar=('BEFORE.json', 'AFTER.json'),
+                   help='compare two dp JSON snapshots offline')
+    a = p.parse_args(argv)
+    shaping = a.depth is not None or a.direct or a.ascii
+    if a.diff:
+        if a.tool or a.directory or extra or a.format != 'tree' or shaping:
+            p.error('--diff takes only two snapshot files')
+        return diff(*a.diff)
+    if a.depth is not None and a.depth < 0:
+        p.error('--depth must be >= 0')
+    if a.format != 'tree' and shaping:
+        p.error('--depth, --direct and --ascii only apply to --format tree')
+    d = os.path.abspath(a.directory or '.')
+    if not os.path.isdir(d):
+        raise Fail('not a directory: %s' % d)
+    # Child-process guards (override inherited values): go uses the local toolchain, bundler may not
+    # relock, Corepack shims may not download a package manager. They do not make tools read-only.
+    os.environ.update(GOTOOLCHAIN='local', BUNDLE_FROZEN='true', COREPACK_ENABLE_NETWORK='0')
+    tool = ALIASES.get(a.tool, a.tool) or detect(d)
+    if a.format == 'native':
+        cmd = TOOLS[tool](d, extra, True)
+        exe = shutil.which(cmd[0])
+        if not exe:
+            raise Fail('%s not found on PATH (dp never substitutes another tool)' % cmd[0])
+        return subprocess.run([exe] + cmd[1:], cwd=d, stdin=subprocess.DEVNULL).returncode
+    g = TOOLS[tool](d, extra, False)
+    if a.format == 'json':
+        print(json.dumps(g.snapshot(dict(g.provenance, directory=d)), indent=2, ensure_ascii=False))
+    else:
+        print(render(g, 1 if a.direct else a.depth, a.ascii))
+    for w in g.warnings:
+        print('dp: warning: %s' % w, file=sys.stderr)
+    return 1 if g.problem else 0
+
+
+def load_snapshot(path):
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        raise Fail('%s: %s' % (path, e))
+
+    def bad(why):
+        raise Fail('%s is not a %s snapshot: %s' % (path, SCHEMA, why))
+    if not isinstance(data, dict) or data.get('schema') != SCHEMA:
+        bad('missing or different "schema"')
+    if not all(isinstance(data.get(k), list) for k in ('nodes', 'edges', 'roots')):
+        bad('nodes, edges and roots must be lists')
+    nodes = {}
+    for n in data['nodes']:
+        if not (isinstance(n, dict) and valid_fields([n.get('id'), n.get('name')], *map(n.get, OPTIONAL))) \
+                or n['id'] in nodes:
+            bad('invalid or duplicate node %r (id/name must be non-empty text; %s absent, null or text)'
+                % (n, '/'.join(OPTIONAL)))
+        nodes[n['id']] = {k: v for k, v in n.items() if v is not None}  # null == absent
+    edge_set = set()
+    for e in data['edges']:
+        if not (isinstance(e, dict) and valid_fields([e.get('from'), e.get('to')], e.get('label'))
+                and e['from'] in nodes and e['to'] in nodes):
+            bad('invalid edge %r' % (e,))
+        edge_set.add((e['from'], e['to'], e.get('label') or None))
+    if not all(isinstance(r, str) and r in nodes for r in data['roots']):
+        bad('every root must be a node id')
+    return nodes, set(data['roots']), edge_set
+
+
+def diff(before, after):
+    """Compare graphs only (nodes, roots, edges); tool, warnings and provenance are ignored."""
+    (n1, r1, e1), (n2, r2, e2) = load_snapshot(before), load_snapshot(after)
+    groups = {}  # same package in the same context: report version changes as ~
+    for sign, nodes, other in (('-', n1, n2), ('+', n2, n1)):
+        for nid in sorted(nodes.keys() - other.keys()):
+            n = nodes[nid]
+            groups.setdefault((n['name'], n.get('context') or '', n.get('kind') or ''), {'-': [], '+': []})[sign].append(n)
+    out = []
+    for (name, context, _), g in sorted(groups.items()):
+        if g['-'] and g['+']:
+            ver = lambda ns: ', '.join(' '.join(filter(None, [n.get('version') or '-', n.get('status') and '[%s]' % n['status']]))
+                                       for n in ns)
+            out.append('~ %s%s: %s -> %s' % (name, context and ' [%s]' % context, ver(g['-']), ver(g['+'])))
+        else:
+            out += ['%s %s' % (s, n['id']) for s in '-+' for n in g[s]]
+    out += ['~ %s: node fields changed' % i for i in sorted(n1.keys() & n2.keys()) if n1[i] != n2[i]]
+    out += ['- root %s' % r for r in sorted(r1 - r2)] + ['+ root %s' % r for r in sorted(r2 - r1)]
+    for sign, es in (('-', e1 - e2), ('+', e2 - e1)):
+        out += ['%s edge %s -> %s%s' % (sign, a, b, l and ' (%s)' % l or '')
+                for a, b, l in sorted(es, key=lambda e: (e[0], e[1], e[2] or ''))]
+    if out:
+        print('\n'.join(out))
+    return 1 if out else 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Fail as e:
+        print('dp: %s' % e, file=sys.stderr)
+        sys.exit(2)
+    except KeyboardInterrupt:
+        sys.exit(130)

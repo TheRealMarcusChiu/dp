@@ -1,0 +1,49 @@
+{
+  "packages": [
+    {"name": "app", "version": "0.1.0", "id": "path+file:///w/app#0.1.0", "source": null, "dependencies": []},
+    {"name": "tool", "version": "0.1.0", "id": "path+file:///w/tool#0.1.0", "source": null, "dependencies": []},
+    {"name": "serde", "version": "1.0.200", "id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.200", "dependencies": []},
+    {"name": "serde_derive", "version": "1.0.200", "id": "registry+https://github.com/rust-lang/crates.io-index#serde_derive@1.0.200", "dependencies": []},
+    {"name": "cc", "version": "1.0.90", "id": "registry+https://github.com/rust-lang/crates.io-index#cc@1.0.90", "dependencies": []},
+    {"name": "winapi", "version": "0.3.9", "id": "registry+https://github.com/rust-lang/crates.io-index#winapi@0.3.9", "dependencies": []}
+  ],
+  "workspace_members": ["path+file:///w/app#0.1.0", "path+file:///w/tool#0.1.0"],
+  "workspace_default_members": ["path+file:///w/app#0.1.0", "path+file:///w/tool#0.1.0"],
+  "resolve": {
+    "nodes": [
+      {
+        "id": "path+file:///w/app#0.1.0",
+        "dependencies": ["registry+https://github.com/rust-lang/crates.io-index#cc@1.0.90", "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.200", "registry+https://github.com/rust-lang/crates.io-index#winapi@0.3.9"],
+        "deps": [
+          {"name": "cc", "pkg": "registry+https://github.com/rust-lang/crates.io-index#cc@1.0.90", "dep_kinds": [{"kind": "build", "target": null}]},
+          {"name": "serde", "pkg": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.200", "dep_kinds": [{"kind": null, "target": null}]},
+          {"name": "winapi", "pkg": "registry+https://github.com/rust-lang/crates.io-index#winapi@0.3.9", "dep_kinds": [{"kind": null, "target": "cfg(windows)"}]}
+        ],
+        "features": ["default"]
+      },
+      {
+        "id": "path+file:///w/tool#0.1.0",
+        "dependencies": ["path+file:///w/app#0.1.0", "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.200"],
+        "deps": [
+          {"name": "app", "pkg": "path+file:///w/app#0.1.0", "dep_kinds": [{"kind": null, "target": null}]},
+          {"name": "serde", "pkg": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.200", "dep_kinds": [{"kind": "dev", "target": null}]}
+        ],
+        "features": []
+      },
+      {
+        "id": "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.200",
+        "dependencies": ["registry+https://github.com/rust-lang/crates.io-index#serde_derive@1.0.200"],
+        "deps": [{"name": "serde_derive", "pkg": "registry+https://github.com/rust-lang/crates.io-index#serde_derive@1.0.200", "dep_kinds": [{"kind": null, "target": null}]}],
+        "features": ["derive", "serde_derive", "std"]
+      },
+      {"id": "registry+https://github.com/rust-lang/crates.io-index#serde_derive@1.0.200", "dependencies": [], "deps": [], "features": []},
+      {"id": "registry+https://github.com/rust-lang/crates.io-index#cc@1.0.90", "dependencies": [], "deps": [], "features": []},
+      {"id": "registry+https://github.com/rust-lang/crates.io-index#winapi@0.3.9", "dependencies": [], "deps": [], "features": []}
+    ],
+    "root": null
+  },
+  "target_directory": "/w/target",
+  "version": 1,
+  "workspace_root": "/w",
+  "metadata": null
+}
